@@ -1,6 +1,8 @@
 #include "AnalogueKeyboard.hpp"
 
 #include <cstring> // memset
+#include <chrono>  // keepalive timing
+#include <thread>  // sleep to avoid busy-spin
 
 #include "DigitalKeyboard.hpp"
 #include "HidScancode.hpp"
@@ -200,6 +202,17 @@ NAMESPACE_SOUP
 				// If I wanted to be stupid, I could buy their FIRE68 Ultra & NANO68 Pro just to map in the layouts for the shitty polling interface.
 			}
 		}
+		// Aula
+		else if (hid.vendor_id == 0x2E3C)
+		{
+			if (hid.usage_page == 0xFF1B && hid.usage == 0x91)
+			{
+				if (hid.product_id == 0xC365)
+				{
+					return "Aula Win 68 HE";
+				}
+			}
+		}
 
 		return {};
 	}
@@ -302,6 +315,18 @@ NAMESPACE_SOUP
 		KEY_LCTRL,     KEY_LMETA, KEY_LALT, KEY_NONE, KEY_NONE, KEY_NONE, KEY_SPACE, KEY_NONE, KEY_NONE, KEY_RALT,  KEY_FN,        KEY_RCTRL,        KEY_ARROW_LEFT,    KEY_ARROW_DOWN, KEY_ARROW_RIGHT,
 	};
 
+	// Aula Win 68 HE. The vendor interface streams (row, col, travel) frames.
+	// Indexed [row][col]; rows 1..5, cols 0..16. KEY_NONE = no key at that matrix position.
+	static constexpr float AULA_TRAVEL_MAX = 350.0f; // full press tops out around 350-370; tune if full presses don't reach 1.0
+	static const Key layout_aula_win68he[6][17] = {
+		{ KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE },
+		{ KEY_ESCAPE,    KEY_1,     KEY_2,    KEY_3,    KEY_4,    KEY_5,    KEY_6,     KEY_7,    KEY_8,    KEY_9,     KEY_0,         KEY_MINUS,        KEY_EQUALS,        KEY_NONE,       KEY_BACKSPACE,  KEY_NONE,       KEY_DEL },
+		{ KEY_TAB,       KEY_Q,     KEY_W,    KEY_E,    KEY_R,    KEY_T,    KEY_Y,     KEY_U,    KEY_I,    KEY_O,     KEY_P,         KEY_BRACKET_LEFT, KEY_BRACKET_RIGHT, KEY_NONE,       KEY_BACKSLASH,  KEY_NONE,       KEY_PAGE_UP },
+		{ KEY_CAPS_LOCK, KEY_NONE,  KEY_A,    KEY_S,    KEY_D,    KEY_F,    KEY_G,     KEY_H,    KEY_J,    KEY_K,     KEY_L,         KEY_SEMICOLON,    KEY_QUOTE,         KEY_NONE,       KEY_ENTER,      KEY_NONE,       KEY_PAGE_DOWN },
+		{ KEY_LSHIFT,    KEY_NONE,  KEY_Z,    KEY_X,    KEY_C,    KEY_V,    KEY_B,     KEY_N,    KEY_M,    KEY_COMMA, KEY_PERIOD,    KEY_SLASH,        KEY_NONE,          KEY_RSHIFT,     KEY_NONE,       KEY_ARROW_UP,   KEY_END },
+		{ KEY_LCTRL,     KEY_LMETA, KEY_LALT, KEY_NONE, KEY_NONE, KEY_NONE, KEY_SPACE, KEY_NONE, KEY_NONE, KEY_RALT,  KEY_NONE,      KEY_FN,           KEY_RCTRL,         KEY_NONE,       KEY_ARROW_LEFT, KEY_ARROW_DOWN, KEY_ARROW_RIGHT },
+	};
+
 	AnalogueKeyboard::AnalogueKeyboard(std::string&& name, hwHid&& hid, bool has_ctx_key)
 		: name(std::move(name)), hid(std::move(hid)), has_ctx_key(has_ctx_key)
 	{
@@ -399,6 +424,11 @@ NAMESPACE_SOUP
 							kbd.madlions.layout_size = sizeof(layout_madlions_mad68he);
 							kbd.madlions.layout = layout_madlions_mad68he;
 						}
+					}
+					else if (kbd.hid.vendor_id == 0x2E3C) // Aula
+					{
+						kbd.aula.consecutive_empty_reports = 0;
+						memset(kbd.aula.buffer, 0, sizeof(kbd.aula.buffer));
 					}
 				}
 			}
@@ -596,6 +626,10 @@ NAMESPACE_SOUP
 		else if (hid.vendor_id == 0x373b)
 		{
 			return getActiveKeysMadlions();
+		}
+		else if (hid.vendor_id == 0x2E3C)
+		{
+			return getActiveKeysAula();
 		}
 		else
 		{
@@ -1238,6 +1272,73 @@ if (combined[i]) \
 #if SOUP_WINDOWS
 		mtx.unlock();
 #endif
+
+		return keys;
+	}
+
+	std::vector<ActiveKey> AnalogueKeyboard::getActiveKeysAula()
+	{
+		using namespace std::chrono;
+
+		// The Aula only streams analogue data while the host keeps sending this
+		// 64-byte "keepalive" report (report id 0x01, data[0]=0x01) about once a
+		// second. Without it, the keyboard reverts to normal (digital) mode.
+		// We resend it every 700 ms, comfortably under the ~1 s timeout.
+		static thread_local steady_clock::time_point s_next_keepalive{};
+		const auto t_now = steady_clock::now();
+		if (t_now >= s_next_keepalive)
+		{
+			static const uint8_t keepalive[64] = { 0x01, 0x01 }; // rest is zero-filled
+			if (!hid.sendReport(keepalive, sizeof(keepalive)))
+			{
+				disconnected = true;
+			}
+			s_next_keepalive = t_now + milliseconds(700);
+		}
+
+		std::vector<ActiveKey> keys{};
+
+		// Non-blocking read: only consume a report if one is waiting, so we never
+		// block past the next keepalive deadline while idle.
+		if (hid.hasReport())
+		{
+			const Buffer<>& report = hid.receiveReport();
+
+			// Report bytes (incl. the leading HID report id at [0]):
+			//   [1]=0x21 marker, [5]=subtype (3 or 5), [6]=key count (1),
+			//   [7]=row, [8]=col, [9..10]=travel value (little-endian, 0..~380)
+			if (report.size() >= 11 && report[1] == 0x21)
+			{
+				const uint8_t row = report[7];
+				const uint8_t col = report[8];
+				const uint16_t value = static_cast<uint16_t>(report[9] | (report[10] << 8));
+
+				if (row >= 1 && row <= 5 && col <= 16)
+				{
+					const Key sk = layout_aula_win68he[row][col];
+					if (sk != KEY_NONE)
+					{
+						float fvalue = static_cast<float>(value) / AULA_TRAVEL_MAX;
+						if (fvalue > 1.0f) { fvalue = 1.0f; }
+						aula.buffer[sk] = static_cast<uint8_t>(fvalue * 255.0f);
+					}
+				}
+			}
+		}
+		else
+		{
+			std::this_thread::sleep_for(milliseconds(1)); // avoid busy-spin
+		}
+
+		// The keyboard streams one key per report, so we keep the last value of
+		// every key and return all keys that are currently held down.
+		for (uint16_t sk = 0; sk != NUM_KEYS; ++sk)
+		{
+			if (aula.buffer[sk] != 0)
+			{
+				keys.emplace_back(ActiveKey{ static_cast<Key>(sk), static_cast<float>(aula.buffer[sk]) / 255.0f });
+			}
+		}
 
 		return keys;
 	}
